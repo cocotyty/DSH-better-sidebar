@@ -365,7 +365,11 @@ test('plugin mounts into the DSH shell and survives a built-in tab sweep', async
       await page.locator('[data-dsh-native-tab-host]:visible').getByRole('tab', { name: /^(Session|本轮文件)$/ }).click()
       await page.waitForTimeout(8_000)
       page.off('request', countChangesRequest)
-      expect(changesRequests, '空窗 8 秒内应有一次基线请求和一条等待中的增量请求').toBe(2)
+      // One baseline plus one parked request per WAIT_MS window: the fork parks
+      // 3 s instead of 25 s, so an 8 s idle window holds 2-4 of them. The point
+      // this pins is that idle is NOT a per-poll stream, not the exact count.
+      expect(changesRequests, '空闲 8 秒内应只有一次基线与按等待窗口重开的增量请求').toBeGreaterThanOrEqual(2)
+      expect(changesRequests, '空闲 8 秒内的请求数必须远小于轮询次数').toBeLessThanOrEqual(5)
     }
     await page.waitForTimeout(1_500)
     await assertNoCrash()
