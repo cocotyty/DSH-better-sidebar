@@ -7,20 +7,82 @@
  * the request parks until a matching tool event lands — or {@link WAIT_MS}
  * expires — instead of re-reading an unchanged window every poll. The reply is
  * still the same delta shape, so the client never needs a second code path.
+ *
+ * The window is the FILE-OPERATION tail, not the whole tool stream: a call is
+ * kept only when its tool touches a file ({@link FILE_OP_TOOLS}), and a result
+ * only when it settles such a call. Shell output and `<code>` program bodies
+ * are dropped on the host, so a long session's reply stays in the hundreds of
+ * kilobytes instead of the megabytes it reached when every tool row shipped.
  */
 import type { Context, SidebarSessionEvent } from './context-types.ts'
 import { readPersistedSession } from './session-store.ts'
 import { requireString, SidebarError } from './wire.ts'
 
 /** Recent-window bound: the lens shows the recent tail, not eternity. */
-const EVENTS_CAP = 4000
+const EVENTS_CAP = 200
 /** How long one `wait: true` request parks before answering with the window. */
-const WAIT_MS = 25_000
+const WAIT_MS = 3_000
 
-/** The event types the session lens folds — a plain tool pair, or a PTC one. */
+/** The event types that can carry a file operation — a plain tool pair, or a PTC one. */
 function isFileToolEvent(event: SidebarSessionEvent): boolean {
   return event.type === 'tool/call' || event.type === 'tool/result'
     || event.type === 'tool/ptc-dispatch-start' || event.type === 'tool/ptc-dispatch'
+}
+
+/**
+ * The tool names the session lens folds, mirroring `kindOf` in
+ * `src/client/changes/ops.ts`; a name outside this set touches no file.
+ */
+const FILE_OP_TOOLS = new Set([
+  'read', 'view', 'see',
+  'write', 'create',
+  'edit', 'str_replace', 'str-replace-editor', 'multi-edit',
+])
+
+/**
+ * The call identity of one tool event: a call or PTC row names it directly, a
+ * result carries it on the settled message.
+ * @param event - one session event.
+ * @returns the id, or undefined when the row carries none.
+ */
+function callIdOf(event: SidebarSessionEvent): string | undefined {
+  const data = event.data
+  if (event.type === 'tool/result') {
+    const message = data.message
+    if (typeof message !== 'object' || message === null) return undefined
+    const record = message as { toolCallId?: unknown; source?: { callId?: unknown } }
+    const id = record.toolCallId ?? record.source?.callId
+    return typeof id === 'string' ? id : undefined
+  }
+  const id = event.type === 'tool/call' ? data.callId : data.subCallId
+  return typeof id === 'string' ? id : undefined
+}
+
+/**
+ * Whether a call or PTC row names a file tool. A result has no name of its
+ * own, so it never qualifies here; it is kept by {@link isFileOpEvent} instead.
+ * @param event - one session event.
+ * @returns whether the row is a file-tool call.
+ */
+function isFileOpName(event: SidebarSessionEvent): boolean {
+  if (event.type === 'tool/result') return false
+  const name = event.data.name
+  return typeof name === 'string' && FILE_OP_TOOLS.has(name)
+}
+
+/**
+ * Whether one event belongs in the window: a file-tool call, or the result that
+ * settles one already seen in the same pass.
+ * @param event - one session event.
+ * @param callIds - call ids of the file tools read from the same log.
+ * @returns whether the lens can fold this row.
+ */
+function isFileOpEvent(event: SidebarSessionEvent, callIds: ReadonlySet<string>): boolean {
+  if (!isFileToolEvent(event)) return false
+  if (isFileOpName(event)) return true
+  if (event.type !== 'tool/result') return false
+  const id = callIdOf(event)
+  return id !== undefined && callIds.has(id)
 }
 
 /**
@@ -44,7 +106,10 @@ export function createChangesOpsApi(ctx: Context): (payload: unknown, signal?: A
     }
     const afterSeq = rawAfter ?? -1
 
-    /** Read the live or persisted log, keeping only the delta past the cursor. */
+    /** Call ids of the file tools in the current log, so results can be matched to their call. */
+    const fileCallIds = new Set<string>()
+
+    /** Read the live or persisted log, keeping only the file-operation delta past the cursor. */
     const readWindow = async (): Promise<{ events: SidebarSessionEvent[]; lastSeq: number }> => {
       let events: readonly SidebarSessionEvent[] | undefined = ctx.sessions.get(sessionId)?.snapshotEvents()
       if (events === undefined) {
@@ -58,7 +123,14 @@ export function createChangesOpsApi(ctx: Context): (payload: unknown, signal?: A
           }
         }
       }
-      const filtered = (events ?? []).filter(event => isFileToolEvent(event) && event.seq > afterSeq)
+      const log = events ?? []
+      fileCallIds.clear()
+      for (const event of log) {
+        if (!isFileOpName(event)) continue
+        const id = callIdOf(event)
+        if (id !== undefined) fileCallIds.add(id)
+      }
+      const filtered = log.filter(event => event.seq > afterSeq && isFileOpEvent(event, fileCallIds))
       const window = filtered.length > EVENTS_CAP ? filtered.slice(-EVENTS_CAP) : filtered
       return { events: window, lastSeq: window.at(-1)?.seq ?? afterSeq }
     }
@@ -81,8 +153,12 @@ export function createChangesOpsApi(ctx: Context): (payload: unknown, signal?: A
         time: event.time,
         data: event.data as Record<string, unknown>,
       }
-      if ((session as { id?: unknown } | null)?.id !== sessionId
-        || !isFileToolEvent(minimal) || minimal.seq <= afterSeq) return
+      if ((session as { id?: unknown } | null)?.id !== sessionId || minimal.seq <= afterSeq) return
+      if (isFileOpName(minimal)) {
+        const id = callIdOf(minimal)
+        if (id !== undefined) fileCallIds.add(id)
+      }
+      if (!isFileOpEvent(minimal, fileCallIds)) return
       pending.push(minimal)
       if (pending.length > EVENTS_CAP) pending.shift()
       wake?.()
