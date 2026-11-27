@@ -14,13 +14,11 @@
  * height and the pane tab persist in the tab's meta, so the tab reopens
  * exactly where it was left.
  *
- * The session events ride the host's `changes.ops` route (the client runtime
- * exposes no event-log face): the tab pulls the delta past its cursor and
- * folds it into ops, and publishes the op count to a module-level cache the
- * tab-strip badge reads. The pull is one catch-up whenever the tab becomes
- * visible and then a cadence ONLY while the session lens is on screen — the
- * git lens has no use for the session event log (and the shared git-status
- * store owns its own poller).
+ * The session events ride the shared Remote invalidation feed and the bounded
+ * `changes.ops` cursor route: ready/change triggers a catch-up, while a
+ * terminal Remote failure alone restores the old session-lens cadence. The
+ * tab keeps its complete op fold and publishes the count for the tab-strip
+ * badge; the editor's smaller touched projection shares the same Remote feed.
  */
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { IconRefreshOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -29,6 +27,7 @@ import type { TabComponentProps } from '../service.ts'
 import { t } from '../locales.ts'
 import { api } from '../api.ts'
 import { usePolling } from '../use-polling.ts'
+import { retainSessionEvents, usePageVisible } from '../session-events.ts'
 import type { SidebarDiffRef } from '../state.ts'
 import { IconButton, Notice } from '../ui/index.ts'
 import { GitLens } from './GitLens.tsx'
@@ -45,12 +44,14 @@ const PANE_HEIGHT_DEFAULT = 300
 /** Cap on accumulated events: the lens shows the recent window, not eternity
  *  (the host enforces the same bound per response). */
 const EVENTS_CAP = 4000
+/** A full primed host page is followed immediately by the next cursor page. */
+const EVENTS_PAGE_CAP = 200
 
-/** Live op count per session: the tab's poller writes, the badge reads (a
+/** Live op count per session: the tab's cursor fold writes, the badge reads (a
  *  badge cannot fetch — it must resolve synchronously during render). */
 const opCounts = new Map<string, number>()
 
-/** The session's traced-op count as of the last poll (undefined before the
+/** The session's traced-op count as of the last cursor pull (undefined before the
  *  tab has ever pulled; 0 hides the badge pill). */
 export function opCountOf(sessionId: string): number | undefined {
   return opCounts.get(sessionId)
@@ -81,6 +82,7 @@ type PreviewSelection =
   | { kind: 'op'; path: string; callId: string }
 
 export function ChangesTab({ ctx, scope, tab, visible, onOpenFile, onOpenDiff }: TabComponentProps) {
+  const pageVisible = usePageVisible()
   const meta = (tab.meta ?? {}) as ChangesMeta
   const lensId = useId()
   const [lens, setLens] = useState<Lens>(meta.lens === 'session' ? 'session' : 'git')
@@ -98,54 +100,62 @@ export function ChangesTab({ ctx, scope, tab, visible, onOpenFile, onOpenDiff }:
     typeof meta.previewH === 'number' ? meta.previewH : PANE_HEIGHT_DEFAULT,
   ))
 
-  // ── Session-event accumulation: one catch-up pull when the tab becomes
-  //    visible, then a 2.5s delta poll while the SESSION lens is on screen.
-  //    The cursor is the last delivered seq, so each poll ships only what the
-  //    accumulator lacks; once primed, the poll WAITS host-side for the next
-  //    tool event (25s ceiling) instead of replaying an unchanged window. ────
+  // ── Session-event accumulation: ready/change and visibility trigger cursor
+  //    pulls. Only a degraded session lens uses the old 2.5s cadence; a primed
+  //    degraded pull may still park briefly in the host's wait form. ─────────
   const eventsRef = useRef<readonly SidebarSessionEvent[]>([])
-  // The fold of eventsRef as of the last poll. extractFileOps parses every
-  // accumulated tool call (up to EVENTS_CAP events); running it once per
-  // poll and REUSING the result across renders keeps the 2.5s tick at one
-  // fold, and an unchanged answer never hands downstream memos a new array.
+  // Fold once per cursor page and reuse the result across renders. An unchanged
+  // answer never hands downstream memos a new array.
   const opsRef = useRef<readonly FileOp[]>([])
   const seqRef = useRef(-1)
   const primedRef = useRef(false)
   const pollGen = useRef(0)
-  /** One delta request in flight at a time (the poller is fixed-interval, so a
-   *  slow host would otherwise run two pulls over the same cursor and append
-   *  the same delta twice). A pull that arrives while one is running is a
-   *  no-op: the in-flight answer already carries everything up to now. */
+  /** One delta request in flight; another trigger records one trailing dirty
+   *  run instead of appending the same cursor delta twice. */
   const pullingRef = useRef(false)
+  const dirtyRef = useRef(false)
+  const degradedRef = useRef(false)
+  const [degraded, setDegraded] = useState(false)
   const [opsError, setOpsError] = useState(false)
   const [tick, setTick] = useState(0)
   const pull = useCallback(async (signal?: AbortSignal): Promise<void> => {
     const generation = pollGen.current
-    if (pullingRef.current) return
+    if (pullingRef.current) {
+      dirtyRef.current = true
+      return
+    }
     pullingRef.current = true
     try {
-      const { events, lastSeq } = await api.changesOps(scope, primedRef.current ? seqRef.current : undefined, signal, primedRef.current)
-      // An aborted poll belongs to a torn-down run: its answer must never
-      // publish state (the transport may deliver it anyway).
-      if (generation !== pollGen.current || signal?.aborted === true) return
-      primedRef.current = true
-      // Nothing new: KEEP the previous fold's identity. Re-folding an unchanged
-      // window produced a fresh array every tick, which defeated every
-      // downstream memo (the session lens re-encodes each op body to size it).
-      if (events.length === 0 && lastSeq <= seqRef.current && opsRef.current.length > 0) {
-        setOpsError(false)
-        return
+      while (generation === pollGen.current) {
+        dirtyRef.current = false
+        let wait = degradedRef.current && primedRef.current
+        for (;;) {
+          const baseline = !primedRef.current
+          const previousSeq = seqRef.current
+          const { events, lastSeq } = await api.changesOps(scope, baseline ? undefined : previousSeq, signal, wait)
+          // An aborted pull belongs to a torn-down run: its answer must never
+          // publish state (the transport may deliver it anyway).
+          if (generation !== pollGen.current || signal?.aborted === true) return
+          primedRef.current = true
+          wait = false
+          // Keep the previous fold's identity when nothing changed.
+          const unchanged = events.length === 0 && lastSeq <= seqRef.current && opsRef.current.length > 0
+          if (!unchanged) {
+            if (events.length > 0) {
+              const merged = [...eventsRef.current, ...events]
+              eventsRef.current = merged.length > EVENTS_CAP ? merged.slice(merged.length - EVENTS_CAP) : merged
+            }
+            if (lastSeq > seqRef.current) seqRef.current = lastSeq
+            const folded = extractFileOps(eventsRef.current, scope.cwd)
+            opsRef.current = folded
+            opCounts.set(scope.sessionId, folded.length)
+            setTick(value => value + 1)
+          }
+          setOpsError(false)
+          if (baseline || events.length < EVENTS_PAGE_CAP || lastSeq <= previousSeq) break
+        }
+        if (!dirtyRef.current) break
       }
-      if (events.length > 0) {
-        const merged = [...eventsRef.current, ...events]
-        eventsRef.current = merged.length > EVENTS_CAP ? merged.slice(merged.length - EVENTS_CAP) : merged
-      }
-      if (lastSeq > seqRef.current) seqRef.current = lastSeq
-      const folded = extractFileOps(eventsRef.current, scope.cwd)
-      opsRef.current = folded
-      opCounts.set(scope.sessionId, folded.length)
-      setOpsError(false)
-      setTick(value => value + 1)
     } catch {
       // Offline / route unavailable: keep the last fold; surface it inline
       // only while nothing has ever loaded.
@@ -153,7 +163,7 @@ export function ChangesTab({ ctx, scope, tab, visible, onOpenFile, onOpenDiff }:
     } finally {
       if (generation === pollGen.current) pullingRef.current = false
     }
-    // Granular scope fields: only these two gate the poll target.
+    // Granular scope fields: only these two gate the pull target.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope.sessionId, scope.cwd])
   useEffect(() => {
@@ -163,13 +173,44 @@ export function ChangesTab({ ctx, scope, tab, visible, onOpenFile, onOpenDiff }:
     opsRef.current = []
     seqRef.current = -1
     primedRef.current = false
+    dirtyRef.current = false
+    degradedRef.current = false
+    setDegraded(false)
     setOpsError(false)
     return () => { pollGen.current += 1 }
   }, [scope.sessionId])
-  // One catch-up whenever the tab becomes visible (the badge count follows the
-  // tab being opened); the CADENCE below runs only while this lens is showing.
-  useEffect(() => { if (visible) void pull() }, [visible, pull])
-  usePolling(visible && lens === 'session', pull, { intervalMs: 2_500 })
+  // Remote invalidations drive the visible session lens. Each ready generation
+  // performs one cursor catch-up; only a terminal failure enables the old poll.
+  useEffect(() => {
+    if (!visible || !pageVisible || lens !== 'session') return
+    const controller = new AbortController()
+    const update = (): void => {
+      degradedRef.current = false
+      setDegraded(false)
+      void pull(controller.signal)
+    }
+    const release = retainSessionEvents(scope.sessionId, {
+      ready: update,
+      change: update,
+      degraded: () => {
+        degradedRef.current = true
+        setDegraded(true)
+      },
+    })
+    return () => {
+      controller.abort()
+      release()
+    }
+  }, [visible, pageVisible, lens, scope.sessionId, pull])
+  // Visibility owns the one-shot baseline/catch-up in every lens. Remote ready
+  // may share this pull through the single-flight dirty flag.
+  useEffect(() => {
+    if (!visible || !pageVisible) return
+    const controller = new AbortController()
+    void pull(controller.signal)
+    return () => { controller.abort() }
+  }, [visible, pageVisible, pull])
+  usePolling(visible && pageVisible && lens === 'session' && degraded, pull, { intervalMs: 2_500 })
   // tick only forces the re-render; the fold reads the ref directly.
   void tick
   const ops = opsRef.current

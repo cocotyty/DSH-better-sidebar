@@ -44,6 +44,7 @@ import { createClueActionRefreshWatcher, type ClueActionDraftStatus, type ClueAc
 import { invalidateClueAgentSave, type ClueClientResourceInput } from './clues/api.ts'
 import { LOCALE_NS, attachLocale, attachLocaleDicts, t, zh, en } from './locales.ts'
 import { loadChunk } from './chunk-loader.ts'
+import { mountSessionEventsRemote, type SessionEventsRemote } from './session-events.ts'
 
 /** Official host languages whose dictionaries ride the lazy `locale` chunk. */
 const LAZY_LOCALES = new Set(['ja', 'de', 'es', 'fr', 'pt', 'ru'])
@@ -87,6 +88,20 @@ export const inject = ['slots', 'sessions', 'locale', 'modules', 'connection', '
  * @param ctx - the client cordis context (slots, sessions).
  */
 export function apply(ctx: Context): void {
+  ctx.effect(() => {
+    let active = true
+    let dispose: (() => Promise<void>) | undefined
+    void mountSessionEventsRemote(ctx.get('remote') as SessionEventsRemote)
+      .then((mounted) => {
+        if (active) dispose = mounted
+        else void mounted()
+      })
+      .catch((error: unknown) => { console.warn('[dsh-better-sidebar] Remote event namespace unavailable; polling fallback remains active', error) })
+    return async () => {
+      active = false
+      await dispose?.()
+    }
+  }, 'dsh-better-sidebar: Remote event namespace')
   // The sidebar follows the DSH i18n system: attach the locale service so
   // the module-level t()/isZh() resolve the Host-backed language preference
   // (and switch live — the Sidebar root subscribes to it), and register the

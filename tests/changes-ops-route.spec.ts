@@ -111,6 +111,22 @@ describe('changes.ops file-operation window', () => {
     expect(window.lastSeq).toBe(249)
   })
 
+  it('resumes a primed cursor with the oldest page so no events are skipped', async () => {
+    const log = Array.from({ length: 250 }, (_, index) => row('tool/call', index, {
+      callId: `write-${index}`,
+      name: 'write',
+      arguments: JSON.stringify({ file_path: `f${index}.txt`, content: 'x' }),
+    }))
+    const changesOps = createChangesOpsApi(contextWith(log))
+    const first = await changesOps({ sessionId: 'session-1', afterSeq: -1 })
+    expect(first.events).toHaveLength(200)
+    expect(first.events[0]?.seq).toBe(0)
+    expect(first.lastSeq).toBe(199)
+    const second = await changesOps({ sessionId: 'session-1', afterSeq: first.lastSeq })
+    expect(second.events.map(event => event.seq)).toEqual(Array.from({ length: 50 }, (_, index) => index + 200))
+    expect(second.lastSeq).toBe(249)
+  })
+
   it('does not wake the wait form for a non-file tool', async () => {
     const runtime = new CordisContext()
     const fiber = await runtime.plugin(SessionStore)

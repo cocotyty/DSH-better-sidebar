@@ -171,6 +171,9 @@ importers:
       '@deepseek-ai/dsh-tools':
         specifier: 0.2.3-alpha.2
         version: 0.2.3-alpha.2(a9d2bd7b22a2f7334e572a29a081997e)
+      '@deepseek-ai/dsh-typert-protocol':
+        specifier: 0.2.3-alpha.2
+        version: 0.2.3-alpha.2(@deepseek-ai/cordis@4.2.0-alpha.1)(@deepseek-ai/dsh-error@0.2.3-alpha.2(@deepseek-ai/cordis@4.2.0-alpha.1))
       '@deepseek-ai/dsh-user-approval':
         specifier: 0.2.3-alpha.2
         version: 0.2.3-alpha.2(12b2f558630ae3c4a5571f0bf59f5875)
@@ -336,6 +339,9 @@ importers:
       vitest:
         specifier: ^4.1.8
         version: 4.1.11(@types/node@24.13.3)(jsdom@29.1.1)(vite@8.2.2(@types/node@24.13.3)(yaml@2.9.1))
+      zod:
+        specifier: 4.6.6
+        version: 4.6.6
       zustand:
         specifier: ~4.4.7
         version: 4.4.7(@types/react@18.3.31)(immer@10.2.0)(react@18.2.0)

@@ -55,6 +55,8 @@ import { MAX_CLUE_SAVE_BODY_BYTES, readJsonBody, readTextBody, requireString, Si
 import { byteRangeOf, streamFileToResponse } from './file-stream.ts'
 import { fileReadError } from './fs-read-error.ts'
 import { createChangesOpsApi } from './changes-ops.ts'
+import { SidebarEventsRemote } from './events-remote.ts'
+import { SIDEBAR_EVENTS_REMOTE } from './events-remote-info.ts'
 import { BlockAssembler, createUserMessage, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
   buildCommitPrompt,
@@ -122,7 +124,7 @@ export interface SidebarFsLevel {
 }
 
 /** Services required before mounting: routes, sessions, native request admission, and tools. */
-export const inject = ['webServer', 'sessions', 'connection', 'tools']
+export const inject = ['webServer', 'sessions', 'connection', 'tools', 'typert']
 
 /** Content types for media files and HTML preview resources, by extension. */
 const MEDIA_TYPES: Record<string, string> = {
@@ -1259,6 +1261,20 @@ async function importLegacyPrefs(
  */
 export function apply(ctx: Context, config?: SidebarConfig): void {
   const resolved = resolveSidebarConfig(config)
+  // Private invalidation streams ride DSH's existing Remote mux. The namespace
+  // can grow sibling methods without adding another WebSocket upgrade route.
+  if (typeof ctx.typert?.register === 'function') {
+    ctx.effect(() => {
+      new SidebarEventsRemote(ctx)
+      return ctx.typert.register({
+        package: 'dsh-better-sidebar',
+        face: 'host',
+        schemas: [],
+        model: { services: [], events: [], objects: [] },
+        invocations: SIDEBAR_EVENTS_REMOTE.descriptors,
+      })
+    }, 'dsh-better-sidebar: Remote event namespace')
+  }
   // Connection owns both deployment trust and authentication; never infer or
   // bypass its policy from invocation flags or a copied trust list.
   // DSH 0.2.3 deleted `requestRejection`; `admit` is the only admission call and

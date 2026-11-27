@@ -12,22 +12,14 @@
  *
  * Design constraints it exists to honour:
  *
- * - **One poller per session, not one per tab.** The native right sidebar
- *   keeps every visited tab body mounted (`keepMounted`), so an N-editor
- *   session would otherwise run N identical `changes.ops` polls. Members
- *   (editor tabs) elect ONE leader per session; that leader owns the single
- *   `usePolling` loop and every member reads the same published state. Any
- *   member leaving re-elects, and the loop stops when the last one goes.
- * - **The plugin's own `changes.ops` delta stream, on ONE poller per session.**
- *   No `fs.watch`, no `fsRead` fingerprint polling, and no per-tab interval —
- *   a per-tab poll would multiply the same request by the number of mounted
- *   editors. Requests ride `use-polling.ts` (the sidebar's one polling loop)
- *   on the changes tab's own 2.5s cadence, and stop entirely while no editor
- *   of the session is on screen. A primed stream asks the host to WAIT for the
- *   next tool event (25s ceiling) instead of re-reading an unchanged window,
- *   so an idle session costs one parked request rather than a full replay. The
- *   plugin's OWN saves go through `/sidebar/file` and leave no session event,
- *   so a reload can never re-trigger itself.
+ * - **One Remote invalidation subscription per session, not one per tab.**
+ *   Visible editors share a reference-counted record. The host sends only
+ *   `ready` / coalesced dirty bits; `changes.ops` remains the bounded data
+ *   channel, with one in-flight HTTP catch-up and one trailing dirty run.
+ * - **No timer on the healthy path.** A terminal Remote failure re-enables the
+ *   old 2.5s self-scheduling cadence in the session record, not in the hooks.
+ *   A primed degraded pull may still use the host's short wait form. The
+ *   plugin's OWN saves leave no session event, so reloads never self-trigger.
  * - **Settled successes only.** A `write`/`edit` call fires once its result
  *   landed without an error, so a half-written file never reaches a preview
  *   and a failed call never triggers a pointless reload.
@@ -38,25 +30,26 @@
  * - **Session-scoped.** Streams are keyed by session id; a touch published
  *   for one session is invisible to every other session's editors.
  *
- * The stream record outlives its members (only the poller stops): a tab that
- * becomes visible again re-joins, the leader resumes from the persisted `seq`
- * cursor, and the missed delta is folded then — so a file the model rewrote
- * while the tab was parked is still seen as touched. What it does NOT do is
+ * The stream record outlives its visible consumers (only the subscription and
+ * any degraded cadence stop): re-showing a tab resumes from the persisted `seq`
+ * cursor and folds the missed delta. What it does NOT do is
  * live for the page: the record map is bounded and least-recently-joined
  * first (see {@link STREAM_CAP}). A session evicted after that many newer ones
  * re-joins as a FRESH stream, which re-baselines exactly like a page reload
  * (see {@link pullStream}) — the only state a returner can lose, and only
  * after the bound was actually reached.
  */
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useSyncExternalStore } from 'react'
 import type { SidebarSessionEvent } from '../context-types.ts'
 import { api, type SessionScope } from './api.ts'
 import { extractFileOps, type FileOp } from './changes/ops.ts'
 import { resolveSidebarPath } from './paths.ts'
-import { usePolling } from './use-polling.ts'
+import { retainSessionEvents, usePageVisible } from './session-events.ts'
 
-/** The delta cadence: the changes tab's session-lens poll of the same route. */
+/** Degraded-only cadence: healthy Remote invalidations have no timer. */
 export const FILE_OPS_INTERVAL_MS = 2_500
+/** Host page size; a full primed page requires one immediate follow-up read. */
+const EVENTS_PAGE_CAP = 200
 
 /**
  * Events kept for cross-tick `tool/call` → `tool/result` pairing: a call may
@@ -106,10 +99,12 @@ export interface FileOpStreamState {
   readonly revision: number
   /** Comparison key ({@link fileOpKey}) → that path's newest settled touch. */
   readonly touched: ReadonlyMap<string, FileOpTouch>
+  /** Remote failed or is unavailable: the old self-scheduling poll is active. */
+  readonly degraded: boolean
 }
 
 /** The state every session starts from (a stable identity: the store contract). */
-const EMPTY_STATE: FileOpStreamState = { revision: 0, touched: new Map() }
+const EMPTY_STATE: FileOpStreamState = { revision: 0, touched: new Map(), degraded: false }
 
 /**
  * The comparison key of one path, so a model-spelled path and an editor tab's
@@ -137,18 +132,13 @@ export function fileOpKey(cwd: string | undefined, path: string): string {
   return windows ? key.toLowerCase() : key
 }
 
-/** One polling member: an editor tab, and the way to tell it it leads now. */
-interface Member {
-  /** Become (true) or stop being (false) this session's poller. */
-  lead(leading: boolean): void
-}
-
-/** One session's stream: the shared cursor, the published state, the members. */
+/** One session's stream: shared cursor, published state and visible consumers. */
 interface Stream {
+  readonly sessionId: string
   state: FileOpStreamState
   listeners: Set<() => void>
-  members: Set<Member>
-  leader: Member | undefined
+  visible: number
+  releaseEvents: (() => void) | undefined
   /** The delivered cursor (`-1` includes an eventual first event at seq 0). */
   seq: number
   /** Whether the baseline pull completed (only then may a delta publish). */
@@ -156,8 +146,16 @@ interface Stream {
   events: SidebarSessionEvent[]
   /** callIds already accounted for: a settle must fire exactly once. */
   published: Set<string>
-  /** The leader's cwd, used to resolve the model's own relative spellings. */
+  /** The current cwd, used to resolve the model's own relative spellings. */
   cwd: string | undefined
+  /** Single-flight HTTP catch-up with one trailing dirty run. */
+  pullPromise: Promise<void> | undefined
+  pullAbort: AbortController | undefined
+  dirty: boolean
+  /** One self-scheduling degraded loop per session, including its in-flight run. */
+  fallbackActive: boolean
+  fallbackGeneration: number
+  fallbackTimer: number | undefined
 }
 
 /** Every session's stream, bounded by {@link STREAM_CAP} (see `streamOf`). */
@@ -168,26 +166,33 @@ function streamOf(sessionId: string): Stream {
   const existing = streams.get(sessionId)
   if (existing !== undefined) return existing
   // Bound the store before minting: a session nobody is watching is what goes.
-  // A record WITH members is never evicted — it owns the leader election and
-  // the members' published state — so the cap is soft while many sessions are
-  // genuinely open.
+  // A record WITH visible consumers is never evicted — it owns the shared
+  // invalidation subscription and the members' published state — so the cap is
+  // soft while many sessions are genuinely open.
   if (streams.size >= STREAM_CAP) {
     for (const [key, candidate] of streams) {
-      if (candidate.members.size > 0) continue
+      if (candidate.visible > 0) continue
       streams.delete(key)
       if (streams.size < STREAM_CAP) break
     }
   }
   const stream: Stream = {
+    sessionId,
     state: EMPTY_STATE,
     listeners: new Set(),
-    members: new Set(),
-    leader: undefined,
+    visible: 0,
+    releaseEvents: undefined,
     seq: -1,
     primed: false,
     events: [],
     published: new Set(),
     cwd: undefined,
+    pullPromise: undefined,
+    pullAbort: undefined,
+    dirty: false,
+    fallbackActive: false,
+    fallbackGeneration: 0,
+    fallbackTimer: undefined,
   }
   streams.set(sessionId, stream)
   return stream
@@ -198,6 +203,10 @@ function touchStream(sessionId: string, stream: Stream): void {
   if (streams.get(sessionId) !== stream) return
   streams.delete(sessionId)
   streams.set(sessionId, stream)
+}
+
+function emit(stream: Stream): void {
+  for (const listener of stream.listeners) listener()
 }
 
 /** Publish one delta's settled write/edit ops to every member of the stream. */
@@ -218,8 +227,8 @@ function publish(stream: Stream, ops: readonly FileOp[]): void {
     if (touched.size <= TOUCH_WINDOW) break
     touched.delete(key)
   }
-  stream.state = { revision, touched }
-  for (const listener of stream.listeners) listener()
+  stream.state = { ...stream.state, revision, touched }
+  emit(stream)
 }
 
 /**
@@ -247,81 +256,146 @@ function fold(stream: Stream, events: readonly SidebarSessionEvent[], baseline: 
   }
 }
 
-/** One leader's delta pull: advance the cursor, then fold (or baseline) it. */
-async function pullStream(stream: Stream, scope: SessionScope, signal: AbortSignal): Promise<void> {
-  const { events, lastSeq } = await api.changesOps(scope, stream.primed ? stream.seq : undefined, signal, stream.primed)
-  // A torn-down run's answer must never publish state: the transport may
-  // deliver an aborted response anyway.
-  if (signal.aborted === true) return
-  if (scope.cwd !== undefined && scope.cwd !== '') stream.cwd = scope.cwd
-  if (lastSeq > stream.seq) stream.seq = lastSeq
-  const baseline = !stream.primed
-  stream.primed = true
-  if (events.length > 0) fold(stream, events, baseline)
+/** Pull one baseline or every primed page, advancing only after each fold. */
+async function pullStream(stream: Stream, scope: SessionScope, signal: AbortSignal, wait: boolean): Promise<void> {
+  let waitForEvent = wait
+  for (;;) {
+    const baseline = !stream.primed
+    const previousSeq = stream.seq
+    const { events, lastSeq } = await api.changesOps(scope, baseline ? undefined : previousSeq, signal, waitForEvent)
+    // A torn-down run's answer must never publish state: the transport may
+    // deliver an aborted response anyway.
+    if (signal.aborted) return
+    if (scope.cwd !== undefined && scope.cwd !== '') stream.cwd = scope.cwd
+    stream.primed = true
+    if (lastSeq > stream.seq) stream.seq = lastSeq
+    if (events.length > 0) fold(stream, events, baseline)
+    waitForEvent = false
+    // A fresh baseline intentionally selects the recent tail. A primed full
+    // page instead means more deltas remain and the next page starts after it.
+    if (baseline || events.length < EVENTS_PAGE_CAP || lastSeq <= previousSeq) return
+  }
+}
+
+function active(stream: Stream): boolean {
+  return stream.visible > 0 && (typeof document === 'undefined' || document.visibilityState !== 'hidden')
+}
+
+/** One HTTP run shared by Remote invalidations and the degraded polling path. */
+function requestPull(stream: Stream, sessionId: string): Promise<void> {
+  if (!active(stream)) return Promise.resolve()
+  stream.dirty = true
+  if (stream.pullPromise !== undefined) return stream.pullPromise
+  const controller = new AbortController()
+  stream.pullAbort = controller
+  const running = (async () => {
+    try {
+      while (stream.dirty && active(stream) && !controller.signal.aborted) {
+        stream.dirty = false
+        await pullStream(stream, { sessionId, cwd: stream.cwd }, controller.signal, stream.state.degraded && stream.primed)
+      }
+    } finally {
+      if (stream.pullAbort === controller) stream.pullAbort = undefined
+      stream.pullPromise = undefined
+      // A ready barrier may abort an older degraded wait after marking dirty.
+      // Finish that old promise, then run the trailing catch-up on a fresh one.
+      if (stream.dirty && active(stream)) {
+        queueMicrotask(() => { void requestPull(stream, sessionId).catch(() => {}) })
+      }
+    }
+  })()
+  stream.pullPromise = running
+  return running
+}
+
+function stopFallback(stream: Stream): void {
+  stream.fallbackActive = false
+  stream.fallbackGeneration += 1
+  if (stream.fallbackTimer !== undefined) window.clearTimeout(stream.fallbackTimer)
+  stream.fallbackTimer = undefined
+}
+
+/** The old cadence, owned by the session record rather than by any editor hook. */
+function startFallback(stream: Stream): void {
+  if (stream.fallbackActive || !stream.state.degraded || !active(stream)) return
+  stream.fallbackActive = true
+  const generation = ++stream.fallbackGeneration
+  const run = async (): Promise<void> => {
+    if (generation !== stream.fallbackGeneration || !stream.state.degraded || !active(stream)) return
+    try {
+      await requestPull(stream, stream.sessionId)
+    } catch {
+      // Keep the last view; the next degraded tick retries.
+    }
+    if (generation !== stream.fallbackGeneration || !stream.state.degraded || !active(stream)) return
+    stream.fallbackTimer = window.setTimeout(() => {
+      stream.fallbackTimer = undefined
+      void run()
+    }, FILE_OPS_INTERVAL_MS)
+  }
+  void run()
+}
+
+function setDegraded(stream: Stream, degraded: boolean): void {
+  if (stream.state.degraded !== degraded) {
+    stream.state = { ...stream.state, degraded }
+    emit(stream)
+  }
+  if (degraded) startFallback(stream)
+  else stopFallback(stream)
 }
 
 /**
- * Join one session's file-operation stream while `enabled`, and read its
- * published state. Every mounted editor of a session calls this; exactly one
- * of them (the elected leader) runs the poll.
- * @param scope - the session whose log is watched (sessionId + cwd).
- * @param enabled - whether this tab is on screen and holds a real file (a
- * parked tab must not keep polling, and a folder/path-less window has no file
- * to watch).
- * @returns the session's published touches, stable between deltas.
+ * Join one session's file-operation stream while `enabled` and the page is visible.
+ * Every editor reads the same state; one Remote subscription drives the HTTP catch-up.
  */
 export function useFileOpStream(scope: SessionScope, enabled: boolean): FileOpStreamState {
   const { sessionId } = scope
-  const [leading, setLeading] = useState(false)
+  const cwd = scope.cwd
+  const pageVisible = usePageVisible()
+  const armed = enabled && pageVisible && sessionId !== ''
 
   useEffect(() => {
-    if (!enabled || sessionId === '') {
-      setLeading(false)
-      return
-    }
-    const stream = streamOf(sessionId)
-    // The session that just joined is the most recently used, so an ACTIVE
-    // session is never the record a later mint evicts.
-    touchStream(sessionId, stream)
-    const member: Member = { lead: (value: boolean) => { setLeading(value) } }
-    stream.members.add(member)
-    if (stream.leader === undefined) {
-      stream.leader = member
-      setLeading(true)
-    }
-    return () => {
-      stream.members.delete(member)
-      if (stream.members.size === 0 && stream.events.length > IDLE_EVENT_WINDOW) {
-        // Nobody is watching: keep only what a settle landing right now would
-        // still need to pair with. The cursor and the published touches stay,
-        // so the missed delta is folded (and published) when a tab returns.
-        stream.events = stream.events.slice(stream.events.length - IDLE_EVENT_WINDOW)
-      }
-      if (stream.leader !== member) return
-      stream.leader = undefined
-      setLeading(false)
-      // Hand the loop to whoever is left: only a member's own hook can run it.
-      const next = stream.members.values().next().value as Member | undefined
-      if (next !== undefined) {
-        stream.leader = next
-        next.lead(true)
-      }
-    }
-  }, [enabled, sessionId])
-
-  // Granular scope fields: only these two gate the request target (callers
-  // may assemble a scope object themselves).
-  const cwd = scope.cwd
-  const pull = useCallback(async (signal: AbortSignal): Promise<void> => {
-    await pullStream(streamOf(sessionId), { sessionId, cwd }, signal)
+    if (cwd !== undefined && cwd !== '') streamOf(sessionId).cwd = cwd
   }, [sessionId, cwd])
 
-  // Self-scheduling: at most ONE delta request in flight per session, and the
-  // first one runs immediately so the baseline is established before any
-  // delta can be mistaken for a fresh write.
-  usePolling(leading, pull, { intervalMs: FILE_OPS_INTERVAL_MS, mode: 'self-scheduling', immediate: true })
+  useEffect(() => {
+    if (!armed) return
+    const stream = streamOf(sessionId)
+    touchStream(sessionId, stream)
+    stream.visible += 1
+    if (stream.visible === 1) {
+      stream.releaseEvents = retainSessionEvents(sessionId, {
+        ready: () => {
+          setDegraded(stream, false)
+          // Cancel a parked long-poll fallback; ready is the catch-up barrier.
+          stream.pullAbort?.abort()
+          void requestPull(stream, sessionId).catch(() => {})
+        },
+        change: () => {
+          setDegraded(stream, false)
+          void requestPull(stream, sessionId).catch(() => {})
+        },
+        degraded: () => { setDegraded(stream, true) },
+      })
+      startFallback(stream)
+    }
+    return () => {
+      stream.visible = Math.max(0, stream.visible - 1)
+      if (stream.visible > 0) return
+      stream.releaseEvents?.()
+      stream.releaseEvents = undefined
+      stopFallback(stream)
+      stream.pullAbort?.abort()
+      stream.dirty = false
+      if (stream.events.length > IDLE_EVENT_WINDOW) {
+        // The cursor and touches survive, so a return still folds missed deltas.
+        stream.events = stream.events.slice(stream.events.length - IDLE_EVENT_WINDOW)
+      }
+    }
+  }, [armed, sessionId])
 
-  return useSyncExternalStore(
+  const state = useSyncExternalStore(
     useCallback((listener: () => void) => {
       const stream = streamOf(sessionId)
       stream.listeners.add(listener)
@@ -329,4 +403,6 @@ export function useFileOpStream(scope: SessionScope, enabled: boolean): FileOpSt
     }, [sessionId]),
     useCallback(() => streams.get(sessionId)?.state ?? EMPTY_STATE, [sessionId]),
   )
+
+  return state
 }

@@ -131,7 +131,11 @@ export function createChangesOpsApi(ctx: Context): (payload: unknown, signal?: A
         if (id !== undefined) fileCallIds.add(id)
       }
       const filtered = log.filter(event => event.seq > afterSeq && isFileOpEvent(event, fileCallIds))
-      const window = filtered.length > EVENTS_CAP ? filtered.slice(-EVENTS_CAP) : filtered
+      // A baseline is a recent-tail lens. A primed cursor is a journal resume:
+      // return the OLDEST page so the next request can continue without gaps.
+      const window = filtered.length > EVENTS_CAP
+        ? rawAfter === undefined ? filtered.slice(-EVENTS_CAP) : filtered.slice(0, EVENTS_CAP)
+        : filtered
       return { events: window, lastSeq: window.at(-1)?.seq ?? afterSeq }
     }
 
@@ -176,8 +180,11 @@ export function createChangesOpsApi(ctx: Context): (payload: unknown, signal?: A
       // subscription already saw rather than answering "nothing happened".
       const merged = new Map(current.events.map(event => [event.seq, event]))
       for (const event of pending) merged.set(event.seq, event)
-      const events = [...merged.values()].sort((left, right) => left.seq - right.seq).slice(-EVENTS_CAP)
-      return { events, lastSeq: events.at(-1)?.seq ?? afterSeq }
+      const events = [...merged.values()].sort((left, right) => left.seq - right.seq)
+      const page = events.length > EVENTS_CAP
+        ? rawAfter === undefined ? events.slice(-EVENTS_CAP) : events.slice(0, EVENTS_CAP)
+        : events
+      return { events: page, lastSeq: page.at(-1)?.seq ?? afterSeq }
     } finally {
       clearTimeout(timer)
       signal?.removeEventListener('abort', abort)

@@ -31,6 +31,7 @@
  * need them — e.g. the `ws` upgrade hook in src/index.ts).
  */
 import type { Context as CordisContext } from '@deepseek-ai/cordis'
+import type { InvocationDescriptor } from '@deepseek-ai/dsh-typert-protocol'
 import type { BetterSidebarService } from './client/service.ts'
 import type { ProcessActivitySummary } from './process-activity.ts'
 
@@ -951,6 +952,16 @@ export interface SidebarContextShape {
   settings: SidebarSettingsService
   /** The tool registry face. */
   tools: SidebarToolsService
+  /** Host registry for the plugin's generated Remote invocation descriptors. */
+  typert: {
+    register(contribution: {
+      package: string
+      face: 'host'
+      schemas: readonly []
+      model: { services: readonly []; events: readonly []; objects: readonly [] }
+      invocations: readonly InvocationDescriptor[]
+    }): () => Promise<void>
+  }
   /**
    * Host credential seam (optional). S2 resolves a secret per operation from it
    * and never copies the value into preferences, clues, exports or a cache.
@@ -1009,7 +1020,11 @@ export interface SidebarContextShape {
    * event). The listener receives every appended session event with the
    * LIVE Session instance that appended it.
    */
-  on(event: string, listener: (session: unknown, event: SidebarSessionEvent) => void): () => void
+  on(
+    event: string,
+    listener: (session: unknown, event: SidebarSessionEvent) => void,
+    options?: { global?: boolean },
+  ): () => void
   /**
    * The agent's process-local assistant stream (DSH 0.1.5+): one payload per
    * `start` / `chunk` / `end` frame, carrying the emitting agent and the

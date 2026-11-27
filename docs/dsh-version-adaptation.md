@@ -8,13 +8,13 @@
 | 项 | 值 |
 | --- | --- |
 | 基线宿主 | **DSH 0.2.3-alpha.2**（v0.34.0-alpha.0 起；安装下限与 peer 同批抬到 alpha 线） |
-| DSH peer 数量 | **14 条** `@deepseek-ai/dsh-*`，下限全部 `^0.2.3-alpha.2` |
+| DSH peer 数量 | **15 条** `@deepseek-ai/dsh-*`，下限全部 `^0.2.3-alpha.2` |
 | devDependencies | 每条 DSH 包精确钉 `0.2.3-alpha.2`（**30 条**：传递 peer `@deepseek-ai/dsh-error` 在 0.2.2 线已提升进 devDependencies） |
 | 伴随依赖 | Cordis peer `^4.2.0-alpha.1` / dev `4.2.0-alpha.1`、group `~1.2.0-alpha.1`、schemastery `~3.20.0-alpha.1` 解析、include `1.2.0-alpha.1` |
 | `engines.dsh` | **`>=0.2.3-alpha.2 <0.3.0`**（package.json 与 `dsh.plugin.json` 同值；字段存在时宿主只按它判定，peer 不再参与） |
 | 守护测试 | tests/market-manifest.spec.ts（peer 形状）+ tests/dsh-baseline.spec.ts（CI / 脚本 / 文档同版） |
 
-14 条 peer 里包含 `dsh-client-ui-input-trigger`（划选引用 chip 的 `ctx.inputTriggers` 服务）；新增 peer 必须同批更新 AGENTS、本文件、指南与 README 的计数。
+15 条 peer 里包含 `dsh-client-ui-input-trigger`（划选引用 chip 的 `ctx.inputTriggers` 服务）与 `dsh-typert-protocol`（Remote 失效流）；新增 peer 必须同批更新 AGENTS、本文件、指南与 README 的计数。
 
 ## 2. 支持线（用户侧）
 
